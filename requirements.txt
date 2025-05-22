@@ -1,0 +1,7 @@
+streamlit>=1.28.0
+anthropic>=0.25.0
+qdrant-client>=1.7.0
+sentence-transformers>=2.2.2
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
