@@ -43,9 +43,9 @@ def authenticate_user(username: str, password: str) -> bool:
     """Simple authentication (replace with your actual authentication logic)"""
     # For demo purposes - replace with actual authentication
     valid_users = {
-        "admin": "admin123",
-        "user1": "password1",
-        "demo": "demo123"
+        "admin": "admin",
+        "user1": "grant",
+        "demo": "mark"
     }
     return valid_users.get(username) == password
 
