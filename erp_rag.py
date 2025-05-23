@@ -16,11 +16,9 @@ import uuid
 import PyPDF2
 import docx
 import pandas as pd
-import json
-import os
-from typing import List, Dict, Any
 import hashlib
 import hmac
+from typing import List, Dict, Any
 
 # Initialize session state
 if 'authenticated' not in st.session_state:
@@ -34,20 +32,29 @@ if 'uploaded_files' not in st.session_state:
 
 # Configuration
 QDRANT_URL = st.secrets["QDRANT_URL"]
+QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
 COLLECTION_NAME = "project_documents"
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
-# Initialize clients
+# Initialize OpenAI client
+openai_client = openai.Client(api_key=OPENAI_API_KEY)
+
+# Initialize Qdrant client with proper error handling
 @st.cache_resource
 def get_qdrant_client():
-    return AsyncQdrantClient(url=QDRANT_URL)
-
-@st.cache_resource
-def get_openai_client():
-    return openai.Client(api_key=OPENAI_API_KEY)
+    try:
+        client = AsyncQdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY,
+            timeout=30,
+            prefer_grpc=False
+        )
+        return client
+    except Exception as e:
+        st.error(f"Failed to initialize Qdrant client: {e}")
+        return None
 
 qdrant_client = get_qdrant_client()
-openai_client = get_openai_client()
 
 # Document processing functions
 def extract_text_from_pdf(file) -> str:
@@ -109,12 +116,12 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
 
 # Embedding functions
 async def get_embeddings(texts: List[str]) -> List[List[float]]:
-    """Get embeddings from OpenAI with correct dimensions"""
+    """Get embeddings from OpenAI"""
     try:
         response = openai_client.embeddings.create(
             model="text-embedding-3-small",
             input=texts,
-            dimensions=384  # Specify dimension to match Qdrant collection
+            dimensions=384
         )
         return [item.embedding for item in response.data]
     except Exception as e:
@@ -124,21 +131,31 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
 # Qdrant functions
 async def ensure_collection_exists():
     """Ensure the Qdrant collection exists"""
-    try:
-        collections = await qdrant_client.get_collections()
-        collection_names = [col.name for col in collections.collections]
+    if not qdrant_client:
+        return False
         
-        if COLLECTION_NAME not in collection_names:
+    try:
+        # Try to get collection info
+        try:
+            await qdrant_client.get_collection(collection_name=COLLECTION_NAME)
+            return True
+        except:
+            # Collection doesn't exist, create it
             await qdrant_client.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(size=384, distance=Distance.COSINE)
             )
             st.success(f"Created collection: {COLLECTION_NAME}")
+            return True
     except Exception as e:
-        st.error(f"Error checking/creating collection: {e}")
+        st.error(f"Error with Qdrant collection: {e}")
+        return False
 
 async def upload_to_qdrant(chunks: List[str], metadata: Dict[str, Any], username: str):
     """Upload document chunks to Qdrant"""
+    if not qdrant_client:
+        return False
+        
     embeddings = await get_embeddings(chunks)
     if not embeddings:
         return False
@@ -171,6 +188,9 @@ async def upload_to_qdrant(chunks: List[str], metadata: Dict[str, Any], username
 
 async def search_documents(query: str, username: str, limit: int = 5) -> List[Dict[str, Any]]:
     """Search documents in Qdrant"""
+    if not qdrant_client:
+        return []
+        
     query_embedding = await get_embeddings([query])
     if not query_embedding:
         return []
@@ -254,8 +274,8 @@ def main():
                 st.secrets.passwords[st.session_state["username"]],
             ):
                 st.session_state["password_correct"] = True
-                st.session_state["authenticated_username"] = st.session_state["username"]  # Store username separately
-                del st.session_state["password"]  # Don't store the password
+                st.session_state["authenticated_username"] = st.session_state["username"]
+                del st.session_state["password"]
                 del st.session_state["username"]
             else:
                 st.session_state["password_correct"] = False
@@ -278,20 +298,29 @@ def main():
     with col1:
         st.title("ERP Project Manager")
     with col2:
-        st.write("")  # Empty space
+        st.write("")
     with col3:
         user_col1, user_col2 = st.columns([3, 1])
         with user_col1:
             st.markdown(f"**User:** {st.session_state.authenticated_username}")
         with user_col2:
             if st.button("Logout", key="logout_btn", type="secondary"):
-                # Clear session state
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
                 st.rerun()
     
+    # Check Qdrant connection
+    if not qdrant_client:
+        st.error("⚠️ Unable to connect to Qdrant database.")
+        st.info("Please check your Qdrant configuration in Streamlit secrets.")
+        st.stop()
+    
     # Ensure collection exists
-    asyncio.run(ensure_collection_exists())
+    collection_ready = asyncio.run(ensure_collection_exists())
+    
+    if not collection_ready:
+        st.error("⚠️ Unable to create or access Qdrant collection.")
+        st.stop()
     
     # Create tabs
     tab1, tab2, tab3 = st.tabs(["📤 Upload Documents", "🔍 Search & Query", "📚 My Documents"])
@@ -359,7 +388,6 @@ def main():
         if st.button("Search", type="primary"):
             if query:
                 with st.spinner("Searching..."):
-                    # Search documents
                     search_results = asyncio.run(search_documents(
                         query, 
                         st.session_state.authenticated_username, 
@@ -367,15 +395,12 @@ def main():
                     ))
                     
                     if search_results:
-                        # Generate RAG response
                         with st.spinner("Generating response..."):
                             response = asyncio.run(generate_rag_response(query, search_results))
                         
-                        # Display response
                         st.markdown("### 💡 Answer")
                         st.markdown(response)
                         
-                        # Display sources
                         st.markdown("### 📄 Sources")
                         for idx, result in enumerate(search_results):
                             with st.expander(f"{result['filename']} (Score: {result['score']:.3f})"):
@@ -393,7 +418,6 @@ def main():
             df = pd.DataFrame(st.session_state.uploaded_files)
             st.dataframe(df, use_container_width=True)
             
-            # Stats
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Total Documents", len(st.session_state.uploaded_files))
