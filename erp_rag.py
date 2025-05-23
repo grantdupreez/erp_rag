@@ -11,6 +11,7 @@ import os
 from sentence_transformers import SentenceTransformer
 import json
 import re
+import hmac
 
 # Configuration
 ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
