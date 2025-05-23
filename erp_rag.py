@@ -12,6 +12,8 @@ from sentence_transformers import SentenceTransformer
 import json
 import re
 import hmac
+import PyPDF2
+import io
 
 # Configuration
 ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
@@ -214,7 +216,9 @@ def check_password():
             st.secrets.passwords[st.session_state["username"]],
         ):
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't store the username or password.
+            # Store the username for later use
+            st.session_state["current_user"] = st.session_state["username"]
+            del st.session_state["password"]  # Don't store the password.
             del st.session_state["username"]
         else:
             st.session_state["password_correct"] = False
@@ -232,7 +236,18 @@ def check_password():
 if not check_password():
     st.stop()
 
-
+def extract_text_from_pdf(pdf_file):
+    """Extract text from PDF file"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page_num in range(len(pdf_reader.pages)):
+            page = pdf_reader.pages[page_num]
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error reading PDF: {e}")
+        return None
 
 def main():
     st.set_page_config(
@@ -244,76 +259,89 @@ def main():
     st.title("🏗️ ERP Project Management RAG Assistant")
     st.markdown("*Powered by Claude 4 and your project knowledge base*")
     
+    # Display current user in the top right
+    col1, col2 = st.columns([6, 1])
+    with col2:
+        st.markdown(f"**User:** {st.session_state.get('current_user', 'Unknown')}")
+    
     # Initialize RAG system
     if 'rag_system' not in st.session_state:
         st.session_state.rag_system = ERPProjectRAG()
     
-    # Sidebar for document management
-    with st.sidebar:
-        st.header("📚 Knowledge Base Management")
-        
-        # Document upload section
-        st.subheader("Add New Project Document")
-        
-        uploaded_file = st.file_uploader(
-            "Upload project document",
-            type=['txt', 'md', 'csv'],
-            help="Upload project documentation, lessons learned, or project reports"
-        )
-        
-        if uploaded_file:
-            # Metadata inputs
-            doc_title = st.text_input("Document Title", value=uploaded_file.name)
-            project_name = st.text_input("Project Name")
-            project_phase = st.selectbox(
-                "Project Phase",
-                ["Planning", "Analysis", "Design", "Development", "Testing", "Deployment", "Post-Implementation"]
-            )
-            document_type = st.selectbox(
-                "Document Type",
-                ["Lessons Learned", "Project Plan", "Risk Assessment", "Requirements", "Technical Specification", "Meeting Notes", "Status Report"]
+    # Sidebar for document management - ONLY FOR ADMIN
+    if st.session_state.get('current_user') == 'admin':
+        with st.sidebar:
+            st.header("📚 Knowledge Base Management")
+            st.markdown("*Admin access only*")
+            
+            # Document upload section
+            st.subheader("Add New Project Document")
+            
+            uploaded_file = st.file_uploader(
+                "Upload project document",
+                type=['txt', 'md', 'csv', 'pdf'],
+                help="Upload project documentation, lessons learned, or project reports"
             )
             
-            if st.button("Add to Knowledge Base"):
-                try:
-                    # Read file content
-                    if uploaded_file.type == "text/plain":
-                        content = str(uploaded_file.read(), "utf-8")
-                    elif uploaded_file.name.endswith('.csv'):
-                        df = pd.read_csv(uploaded_file)
-                        content = df.to_string()
-                    else:
-                        content = str(uploaded_file.read(), "utf-8")
-                    
-                    # Prepare metadata
-                    metadata = {
-                        "title": doc_title,
-                        "project_name": project_name,
-                        "project_phase": project_phase,
-                        "document_type": document_type,
-                        "upload_date": datetime.now().isoformat()
-                    }
-                    
-                    # Add to RAG system
-                    if st.session_state.rag_system.add_document(content, metadata):
-                        st.success("Document added successfully!")
-                    else:
-                        st.error("Failed to add document")
+            if uploaded_file:
+                # Metadata inputs
+                doc_title = st.text_input("Document Title", value=uploaded_file.name)
+                project_name = st.text_input("Project Name")
+                project_phase = st.selectbox(
+                    "Project Phase",
+                    ["Planning", "Analysis", "Design", "Development", "Testing", "Deployment", "Post-Implementation"]
+                )
+                document_type = st.selectbox(
+                    "Document Type",
+                    ["Lessons Learned", "Project Plan", "Risk Assessment", "Requirements", "Technical Specification", "Meeting Notes", "Status Report"]
+                )
+                
+                if st.button("Add to Knowledge Base"):
+                    try:
+                        # Read file content based on type
+                        if uploaded_file.type == "text/plain":
+                            content = str(uploaded_file.read(), "utf-8")
+                        elif uploaded_file.name.endswith('.csv'):
+                            df = pd.read_csv(uploaded_file)
+                            content = df.to_string()
+                        elif uploaded_file.type == "application/pdf":
+                            content = extract_text_from_pdf(uploaded_file)
+                            if content is None:
+                                st.error("Failed to extract text from PDF")
+                                st.stop()
+                        else:
+                            content = str(uploaded_file.read(), "utf-8")
                         
-                except Exception as e:
-                    st.error(f"Error processing file: {e}")
-        
-        st.markdown("---")
-        
-        # Quick stats
-        st.subheader("📊 Knowledge Base Stats")
-        try:
-            collection_info = st.session_state.rag_system.qdrant_client.get_collection(COLLECTION_NAME)
-            st.metric("Total Documents", collection_info.points_count)
-        except:
-            st.metric("Total Documents", "N/A")
+                        # Prepare metadata
+                        metadata = {
+                            "title": doc_title,
+                            "project_name": project_name,
+                            "project_phase": project_phase,
+                            "document_type": document_type,
+                            "upload_date": datetime.now().isoformat(),
+                            "uploaded_by": st.session_state.get('current_user', 'Unknown')
+                        }
+                        
+                        # Add to RAG system
+                        if st.session_state.rag_system.add_document(content, metadata):
+                            st.success("Document added successfully!")
+                        else:
+                            st.error("Failed to add document")
+                            
+                    except Exception as e:
+                        st.error(f"Error processing file: {e}")
+            
+            st.markdown("---")
+            
+            # Quick stats
+            st.subheader("📊 Knowledge Base Stats")
+            try:
+                collection_info = st.session_state.rag_system.qdrant_client.get_collection(COLLECTION_NAME)
+                st.metric("Total Documents", collection_info.points_count)
+            except:
+                st.metric("Total Documents", "N/A")
     
-    # Main chat interface
+    # Main chat interface (visible to all users)
     st.header("💬 Ask Your Project Management Assistant")
     
     # Sample questions
