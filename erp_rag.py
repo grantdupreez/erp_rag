@@ -3,46 +3,82 @@ import anthropic
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 import hashlib
+import hmac
 import uuid
 from datetime import datetime
 import pandas as pd
 from typing import List, Dict, Any
 import os
-from sentence_transformers import SentenceTransformer
 import json
 import re
-import hmac
 import PyPDF2
 import io
 
+# Lazy import to avoid startup issues
+@st.cache_resource
+def load_embedding_model():
+    try:
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer('all-MiniLM-L6-v2')
+    except Exception as e:
+        st.error(f"Error loading embedding model: {e}")
+        return None
+
 # Configuration
-ANTHROPIC_API_KEY = st.secrets["ANTHROPIC_API_KEY"]
-QDRANT_URL = st.secrets["QDRANT_URL"]
-QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
+ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", None)
+QDRANT_URL = st.secrets.get("QDRANT_URL", None)
+QDRANT_API_KEY = st.secrets.get("QDRANT_API_KEY", None)
 COLLECTION_NAME = "erp_projects"
 
 class ERPProjectRAG:
     def __init__(self):
-        self.anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        # Initialize Anthropic client with error handling
+        try:
+            if not ANTHROPIC_API_KEY:
+                st.error("ANTHROPIC_API_KEY not found in secrets")
+                self.anthropic_client = None
+            else:
+                self.anthropic_client = anthropic.Anthropic(api_key=str(ANTHROPIC_API_KEY))
+        except Exception as e:
+            st.error(f"Error initializing Anthropic client: {e}")
+            self.anthropic_client = None
         
         # Initialize Qdrant client
-        if QDRANT_API_KEY:
-            self.qdrant_client = QdrantClient(
-                url=QDRANT_URL,
-                api_key=QDRANT_API_KEY,
-            )
-        else:
-            self.qdrant_client = QdrantClient(host=QDRANT_URL, port=QDRANT_PORT)
+        try:
+            if not QDRANT_URL:
+                st.error("QDRANT_URL not found in secrets")
+                self.qdrant_client = None
+            elif QDRANT_API_KEY:
+                self.qdrant_client = QdrantClient(
+                    url=QDRANT_URL,
+                    api_key=QDRANT_API_KEY,
+                    timeout=30  # Add timeout
+                )
+            else:
+                # Parse URL to extract host and port if needed
+                if ":" in QDRANT_URL and not QDRANT_URL.startswith("http"):
+                    host, port = QDRANT_URL.split(":")
+                    self.qdrant_client = QdrantClient(host=host, port=int(port))
+                else:
+                    # Assuming default port
+                    self.qdrant_client = QdrantClient(url=QDRANT_URL)
+        except Exception as e:
+            st.error(f"Error connecting to Qdrant: {e}")
+            self.qdrant_client = None
         
-        # Initialize embedding model (lightweight alternative to OpenAI)
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        # Initialize embedding model (lazy loading)
+        self.embedding_model = load_embedding_model()
         self.embedding_dim = 384
         
         # Initialize collection if it doesn't exist
-        self._ensure_collection_exists()
+        if self.qdrant_client:
+            self._ensure_collection_exists()
     
     def _ensure_collection_exists(self):
         """Create Qdrant collection if it doesn't exist"""
+        if not self.qdrant_client:
+            return
+            
         try:
             collections = self.qdrant_client.get_collections()
             collection_names = [col.name for col in collections.collections]
@@ -89,6 +125,14 @@ class ERPProjectRAG:
     def add_document(self, content: str, metadata: Dict[str, Any]) -> bool:
         """Add a document to the RAG system"""
         try:
+            if not self.embedding_model:
+                st.error("Embedding model not available")
+                return False
+            
+            if not self.qdrant_client:
+                st.error("Qdrant client not available")
+                return False
+                
             # Generate document ID
             doc_id = str(uuid.uuid4())
             
@@ -129,6 +173,14 @@ class ERPProjectRAG:
     def search_documents(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Search for relevant documents"""
         try:
+            if not self.embedding_model:
+                st.error("Embedding model not available")
+                return []
+            
+            if not self.qdrant_client:
+                st.error("Qdrant client not available")
+                return []
+                
             # Generate query embedding
             query_embedding = self.embedding_model.encode(query).tolist()
             
@@ -157,6 +209,9 @@ class ERPProjectRAG:
     
     def generate_response(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
         """Generate response using Claude 4 with retrieved context"""
+        
+        if not self.anthropic_client:
+            return "I apologize, but the AI service is not configured properly. Please contact your administrator."
         
         # Build context from retrieved documents
         context = "\n\n".join([
@@ -335,11 +390,14 @@ def main():
             
             # Quick stats
             st.subheader("📊 Knowledge Base Stats")
-            try:
-                collection_info = st.session_state.rag_system.qdrant_client.get_collection(COLLECTION_NAME)
-                st.metric("Total Documents", collection_info.points_count)
-            except:
-                st.metric("Total Documents", "N/A")
+            if st.session_state.rag_system.qdrant_client:
+                try:
+                    collection_info = st.session_state.rag_system.qdrant_client.get_collection(COLLECTION_NAME)
+                    st.metric("Total Documents", collection_info.points_count)
+                except:
+                    st.metric("Total Documents", "N/A")
+            else:
+                st.metric("Total Documents", "Not connected")
     
     # Main chat interface (visible to all users)
     st.header("💬 Ask Your Project Management Assistant")
@@ -395,9 +453,16 @@ def main():
         st.session_state.messages.append({"role": "assistant", "content": response})
 
 if __name__ == "__main__":
-    # Check for required environment variables
+    # Check for required configuration
+    missing_keys = []
     if not ANTHROPIC_API_KEY:
-        st.error("Please set your ANTHROPIC_API_KEY environment variable")
+        missing_keys.append("ANTHROPIC_API_KEY")
+    if not QDRANT_URL:
+        missing_keys.append("QDRANT_URL")
+    
+    if missing_keys:
+        st.error(f"Missing required secrets: {', '.join(missing_keys)}")
+        st.info("Please configure these in your Streamlit secrets.")
         st.stop()
     
     main()
