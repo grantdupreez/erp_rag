@@ -1,15 +1,13 @@
 import streamlit as st
 
-# IMPORTANT: Page config must be the first Streamlit command
+# Page config must be first
 st.set_page_config(
-    page_title="ERP Project Manager",
+    page_title="ERP Document Assistant",
     page_icon="📊",
     layout="wide"
 )
 
-import asyncio
-from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from pinecone import Pinecone, ServerlessSpec
 import openai
 from datetime import datetime
 import uuid
@@ -19,428 +17,472 @@ import pandas as pd
 import hashlib
 import hmac
 from typing import List, Dict, Any
+import time
+import json
 
 # Initialize session state
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 if 'username' not in st.session_state:
     st.session_state.username = None
-if 'authenticated_username' not in st.session_state:
-    st.session_state.authenticated_username = None
-if 'uploaded_files' not in st.session_state:
-    st.session_state.uploaded_files = []
 
 # Configuration
-QDRANT_URL = st.secrets["QDRANT_URL"]
-QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
-COLLECTION_NAME = "project_documents"
+PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
+PINECONE_ENVIRONMENT = st.secrets.get("PINECONE_ENVIRONMENT", "us-east-1")
+INDEX_NAME = "erp-documents"
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
-# Initialize OpenAI client
-openai_client = openai.Client(api_key=OPENAI_API_KEY)
+# Initialize OpenAI
+openai.api_key = OPENAI_API_KEY
 
-# Initialize Qdrant client with proper error handling
+# Initialize Pinecone
 @st.cache_resource
-def get_qdrant_client():
+def init_pinecone():
     try:
-        client = AsyncQdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY,
-            timeout=30,
-            prefer_grpc=False
-        )
-        return client
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        # Check if index exists
+        if INDEX_NAME not in pc.list_indexes().names():
+            pc.create_index(
+                name=INDEX_NAME,
+                dimension=1536,  # OpenAI embeddings dimension
+                metric='cosine',
+                spec=ServerlessSpec(
+                    cloud='aws',
+                    region=PINECONE_ENVIRONMENT
+                )
+            )
+            # Wait for index to be ready
+            time.sleep(1)
+        
+        return pc.Index(INDEX_NAME)
     except Exception as e:
-        st.error(f"Failed to initialize Qdrant client: {e}")
+        st.error(f"Failed to initialize Pinecone: {e}")
         return None
-
-qdrant_client = get_qdrant_client()
 
 # Document processing functions
 def extract_text_from_pdf(file) -> str:
     """Extract text from PDF file"""
-    pdf_reader = PyPDF2.PdfReader(file)
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() + "\n"
-    return text
+    try:
+        pdf_reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error reading PDF: {e}")
+        return ""
 
 def extract_text_from_docx(file) -> str:
     """Extract text from DOCX file"""
-    doc = docx.Document(file)
-    text = ""
-    for paragraph in doc.paragraphs:
-        text += paragraph.text + "\n"
-    return text
+    try:
+        doc = docx.Document(file)
+        text = ""
+        for paragraph in doc.paragraphs:
+            text += paragraph.text + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error reading DOCX: {e}")
+        return ""
 
 def extract_text_from_txt(file) -> str:
     """Extract text from TXT file"""
-    return file.read().decode("utf-8")
-
-def process_file(file) -> Dict[str, Any]:
-    """Process uploaded file and extract text"""
-    file_extension = file.name.split('.')[-1].lower()
-    
-    if file_extension == 'pdf':
-        text = extract_text_from_pdf(file)
-    elif file_extension == 'docx':
-        text = extract_text_from_docx(file)
-    elif file_extension == 'txt':
-        text = extract_text_from_txt(file)
-    else:
-        raise ValueError(f"Unsupported file type: {file_extension}")
-    
-    # Generate file hash for deduplication
-    file.seek(0)
-    file_hash = hashlib.md5(file.read()).hexdigest()
-    file.seek(0)
-    
-    return {
-        "text": text,
-        "filename": file.name,
-        "file_type": file_extension,
-        "file_hash": file_hash,
-        "upload_date": datetime.now().isoformat()
-    }
+    try:
+        return file.read().decode("utf-8")
+    except Exception as e:
+        st.error(f"Error reading TXT: {e}")
+        return ""
 
 def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
     """Split text into overlapping chunks"""
+    if not text:
+        return []
+    
     chunks = []
     start = 0
-    while start < len(text):
-        end = start + chunk_size
+    text_length = len(text)
+    
+    while start < text_length:
+        end = min(start + chunk_size, text_length)
         chunk = text[start:end]
-        chunks.append(chunk)
-        start = end - overlap
+        
+        # Avoid empty chunks
+        if chunk.strip():
+            chunks.append(chunk)
+        
+        # Move to next chunk with overlap
+        start = end - overlap if end < text_length else text_length
+    
     return chunks
 
-# Embedding functions
-async def get_embeddings(texts: List[str]) -> List[List[float]]:
+def get_embeddings(texts: List[str]) -> List[List[float]]:
     """Get embeddings from OpenAI"""
     try:
-        response = openai_client.embeddings.create(
+        # Remove empty texts
+        texts = [t for t in texts if t.strip()]
+        if not texts:
+            return []
+            
+        response = openai.embeddings.create(
             model="text-embedding-3-small",
-            input=texts,
-            dimensions=384
+            input=texts
         )
         return [item.embedding for item in response.data]
     except Exception as e:
         st.error(f"Error getting embeddings: {e}")
-        return None
+        return []
 
-# Qdrant functions
-async def ensure_collection_exists():
-    """Ensure the Qdrant collection exists"""
-    if not qdrant_client:
+def upload_to_pinecone(chunks: List[str], metadata: Dict[str, Any], index):
+    """Upload document chunks to Pinecone"""
+    if not chunks:
         return False
         
-    try:
-        # First, check if collection exists by listing all collections
-        collections = await qdrant_client.get_collections()
-        collection_exists = any(c.name == COLLECTION_NAME for c in collections.collections)
-        
-        if collection_exists:
-            # Collection exists, verify we can access it
-            try:
-                await qdrant_client.get_collection(collection_name=COLLECTION_NAME)
-                return True
-            except Exception as e:
-                st.error(f"Collection exists but cannot access it: {e}")
-                return False
-        else:
-            # Collection doesn't exist, create it
-            try:
-                await qdrant_client.create_collection(
-                    collection_name=COLLECTION_NAME,
-                    vectors_config=VectorParams(size=384, distance=Distance.COSINE)
-                )
-                st.success(f"Created collection: {COLLECTION_NAME}")
-                return True
-            except Exception as e:
-                st.error(f"Error creating collection: {e}")
-                return False
-                
-    except Exception as e:
-        st.error(f"Error checking collections: {e}")
-        return False
-
-async def upload_to_qdrant(chunks: List[str], metadata: Dict[str, Any], username: str):
-    """Upload document chunks to Qdrant"""
-    if not qdrant_client:
-        return False
-        
-    embeddings = await get_embeddings(chunks)
+    embeddings = get_embeddings(chunks)
     if not embeddings:
         return False
     
-    points = []
+    # Prepare vectors for upload
+    vectors = []
     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        point_id = str(uuid.uuid4())
-        points.append(
-            PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload={
-                    "text": chunk,
-                    "chunk_index": i,
-                    "username": username,
-                    **metadata
-                }
-            )
-        )
+        vector_id = f"{metadata['file_hash']}_{i}"
+        vectors.append({
+            "id": vector_id,
+            "values": embedding,
+            "metadata": {
+                "text": chunk[:1000],  # Limit metadata size
+                "chunk_index": i,
+                "filename": metadata["filename"],
+                "file_type": metadata["file_type"],
+                "upload_date": metadata["upload_date"],
+                "uploaded_by": metadata["uploaded_by"]
+            }
+        })
     
     try:
-        await qdrant_client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=points
-        )
+        # Upload in batches
+        batch_size = 100
+        for i in range(0, len(vectors), batch_size):
+            batch = vectors[i:i + batch_size]
+            index.upsert(vectors=batch)
         return True
     except Exception as e:
-        st.error(f"Error uploading to Qdrant: {e}")
+        st.error(f"Error uploading to Pinecone: {e}")
         return False
 
-async def search_documents(query: str, username: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Search documents in Qdrant"""
-    if not qdrant_client:
-        return []
-        
-    query_embedding = await get_embeddings([query])
+def search_documents(query: str, index, limit: int = 5) -> List[Dict[str, Any]]:
+    """Search for relevant documents"""
+    query_embedding = get_embeddings([query])
     if not query_embedding:
         return []
     
     try:
-        results = await qdrant_client.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=query_embedding[0],
-            query_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="username",
-                        match=MatchValue(value=username)
-                    )
-                ]
-            ),
-            limit=limit,
-            with_payload=True
+        results = index.query(
+            vector=query_embedding[0],
+            top_k=limit,
+            include_metadata=True
         )
         
         return [
             {
-                "text": hit.payload["text"],
-                "score": hit.score,
-                "filename": hit.payload["filename"],
-                "chunk_index": hit.payload["chunk_index"]
+                "text": match["metadata"]["text"],
+                "score": match["score"],
+                "filename": match["metadata"]["filename"],
+                "chunk_index": match["metadata"]["chunk_index"]
             }
-            for hit in results
+            for match in results["matches"]
         ]
     except Exception as e:
-        st.error(f"Error searching documents: {e}")
+        st.error(f"Error searching: {e}")
         return []
 
-async def generate_rag_response(query: str, context: List[Dict[str, Any]]) -> str:
-    """Generate response using RAG"""
-    context_text = "\n\n".join([f"[{doc['filename']}]: {doc['text']}" for doc in context])
+def generate_response(query: str, context: List[Dict[str, Any]]) -> str:
+    """Generate response using OpenAI"""
+    if not context:
+        return "I couldn't find any relevant information in the uploaded documents."
     
-    prompt = f"""Based on the following context, answer the question. If the answer cannot be found in the context, say so.
+    context_text = "\n\n".join([
+        f"[From {doc['filename']}]:\n{doc['text']}" 
+        for doc in context
+    ])
+    
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant that answers questions based on the provided document context. Only use information from the context to answer questions."
+        },
+        {
+            "role": "user",
+            "content": f"""Based on the following context from uploaded documents, please answer the question.
 
 Context:
 {context_text}
 
 Question: {query}
 
-Answer:"""
+Answer based only on the provided context. If the answer is not in the context, say so."""
+        }
+    ]
     
     try:
-        response = openai_client.chat.completions.create(
+        response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context."},
-                {"role": "user", "content": prompt}
-            ],
+            messages=messages,
             temperature=0.7,
-            max_tokens=500
+            max_tokens=1000
         )
         return response.choices[0].message.content
     except Exception as e:
         st.error(f"Error generating response: {e}")
         return "Sorry, I couldn't generate a response."
 
-# Main application
-def main():
-    # Login page
-    def check_password():
-        """Returns `True` if the user had a correct password."""
-    
-        def login_form():
-            """Form with widgets to collect user information"""
-            with st.form("Credentials"):
-                st.text_input("Username", key="username")
-                st.text_input("Password", type="password", key="password")
-                st.form_submit_button("Log in", on_click=password_entered)
-    
-        def password_entered():
-            """Checks whether a password entered by the user is correct."""
-            if st.session_state["username"] in st.secrets[
-                "passwords"
-            ] and hmac.compare_digest(
-                st.session_state["password"],
-                st.secrets.passwords[st.session_state["username"]],
-            ):
-                st.session_state["password_correct"] = True
-                st.session_state["authenticated_username"] = st.session_state["username"]
-                del st.session_state["password"]
-                del st.session_state["username"]
-            else:
-                st.session_state["password_correct"] = False
-    
-        # Return True if the username + password is validated.
-        if st.session_state.get("password_correct", False):
-            return True
-    
-        # Show inputs for username + password.
-        login_form()
-        if "password_correct" in st.session_state:
-            st.error("😕 User not known or password incorrect")
-        return False
-    
-    if not check_password():
-        st.stop()    
-        
-    # App header with user info and logout
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        st.title("ERP Project Manager")
-    with col2:
-        st.write("")
-    with col3:
-        user_col1, user_col2 = st.columns([3, 1])
-        with user_col1:
-            st.markdown(f"**User:** {st.session_state.authenticated_username}")
-        with user_col2:
-            if st.button("Logout", key="logout_btn", type="secondary"):
-                for key in list(st.session_state.keys()):
-                    del st.session_state[key]
-                st.rerun()
-    
-    # Check Qdrant connection
-    if not qdrant_client:
-        st.error("⚠️ Unable to connect to Qdrant database.")
-        st.info("Please check your Qdrant configuration in Streamlit secrets.")
-        st.stop()
-    
-    # Ensure collection exists
-    collection_ready = asyncio.run(ensure_collection_exists())
-    
-    if not collection_ready:
-        st.error("⚠️ Unable to create or access Qdrant collection.")
-        st.stop()
-    
-    # Create tabs
-    tab1, tab2, tab3 = st.tabs(["📤 Upload Documents", "🔍 Search & Query", "📚 My Documents"])
-    
-    # Upload Documents Tab
-    with tab1:
-        st.header("Upload Project Documents")
-        
-        uploaded_files = st.file_uploader(
-            "Choose files to upload",
-            type=['pdf', 'docx', 'txt'],
-            accept_multiple_files=True,
-            key="file_uploader"
+def get_all_documents(index) -> pd.DataFrame:
+    """Get list of all uploaded documents"""
+    try:
+        # Query with a dummy vector to get metadata
+        results = index.query(
+            vector=[0] * 1536,
+            top_k=10000,
+            include_metadata=True
         )
         
-        if uploaded_files:
-            if st.button("Process and Upload", type="primary"):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                for idx, file in enumerate(uploaded_files):
-                    status_text.text(f"Processing {file.name}...")
-                    progress_bar.progress((idx + 1) / len(uploaded_files))
-                    
-                    try:
-                        # Process file
-                        file_data = process_file(file)
-                        
-                        # Chunk text
-                        chunks = chunk_text(file_data["text"])
-                        
-                        # Upload to Qdrant
-                        success = asyncio.run(upload_to_qdrant(
-                            chunks, 
-                            file_data, 
-                            st.session_state.authenticated_username
-                        ))
-                        
-                        if success:
-                            st.success(f"✅ Successfully uploaded {file.name}")
-                            st.session_state.uploaded_files.append({
-                                "filename": file.name,
-                                "upload_date": file_data["upload_date"],
-                                "chunks": len(chunks)
-                            })
-                        else:
-                            st.error(f"❌ Failed to upload {file.name}")
-                            
-                    except Exception as e:
-                        st.error(f"Error processing {file.name}: {str(e)}")
-                
-                status_text.text("Upload complete!")
-                progress_bar.progress(1.0)
+        # Extract unique documents
+        documents = {}
+        for match in results["matches"]:
+            metadata = match["metadata"]
+            filename = metadata.get("filename", "Unknown")
+            
+            if filename not in documents:
+                documents[filename] = {
+                    "filename": filename,
+                    "upload_date": metadata.get("upload_date", "Unknown"),
+                    "uploaded_by": metadata.get("uploaded_by", "Unknown"),
+                    "file_type": metadata.get("file_type", "Unknown"),
+                    "chunks": 0
+                }
+            documents[filename]["chunks"] += 1
+        
+        if documents:
+            return pd.DataFrame(list(documents.values()))
+        else:
+            return pd.DataFrame()
+            
+    except Exception as e:
+        st.error(f"Error retrieving documents: {e}")
+        return pd.DataFrame()
+
+# Authentication
+def check_password():
+    """Returns `True` if the user had a correct password."""
     
-    # Search & Query Tab
-    with tab2:
-        st.header("Search and Query Documents")
+    def login_form():
+        """Form with widgets to collect user information"""
+        with st.form("Credentials"):
+            st.text_input("Username", key="username")
+            st.text_input("Password", type="password", key="password")
+            st.form_submit_button("Log in", on_click=password_entered)
+    
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        if st.session_state["username"] in st.secrets[
+            "passwords"
+        ] and hmac.compare_digest(
+            st.session_state["password"],
+            st.secrets.passwords[st.session_state["username"]],
+        ):
+            st.session_state["password_correct"] = True
+            st.session_state["authenticated_username"] = st.session_state["username"]
+            del st.session_state["password"]
+            del st.session_state["username"]
+        else:
+            st.session_state["password_correct"] = False
+    
+    # Return True if the username + password is validated.
+    if st.session_state.get("password_correct", False):
+        return True
+    
+    # Show inputs for username + password.
+    login_form()
+    if "password_correct" in st.session_state:
+        st.error("😕 User not known or password incorrect")
+    return False
+
+# Main application
+def main():
+    if not check_password():
+        st.stop()
+    
+    # Initialize Pinecone
+    index = init_pinecone()
+    if not index:
+        st.error("Failed to connect to Pinecone. Please check your configuration.")
+        st.stop()
+    
+    # Header
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.title("📊 ERP Document Assistant")
+    with col2:
+        st.write(f"**User:** {st.session_state.authenticated_username}")
+        if st.button("Logout", type="secondary"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+    
+    # Check if user is admin
+    is_admin = st.session_state.authenticated_username in st.secrets.get("admin_users", [])
+    
+    # Tabs
+    if is_admin:
+        tab1, tab2, tab3 = st.tabs(["💬 Chat", "📤 Upload Documents", "📚 Document Library"])
+    else:
+        tab1, tab3 = st.tabs(["💬 Chat", "📚 Document Library"])
+        tab2 = None
+    
+    # Chat Tab
+    with tab1:
+        st.header("Chat with Documents")
         
-        query = st.text_input("Enter your question or search query:")
+        # Chat interface
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
         
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            num_results = st.number_input("Results to retrieve:", min_value=1, max_value=20, value=5)
+        # Display chat history
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
         
-        if st.button("Search", type="primary"):
-            if query:
-                with st.spinner("Searching..."):
-                    search_results = asyncio.run(search_documents(
-                        query, 
-                        st.session_state.authenticated_username, 
-                        num_results
-                    ))
+        # Chat input
+        if prompt := st.chat_input("Ask a question about your documents"):
+            # Add user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Generate response
+            with st.chat_message("assistant"):
+                with st.spinner("Searching documents..."):
+                    # Search for relevant content
+                    search_results = search_documents(prompt, index, limit=5)
                     
                     if search_results:
-                        with st.spinner("Generating response..."):
-                            response = asyncio.run(generate_rag_response(query, search_results))
-                        
-                        st.markdown("### 💡 Answer")
+                        # Generate response
+                        response = generate_response(prompt, search_results)
                         st.markdown(response)
                         
-                        st.markdown("### 📄 Sources")
-                        for idx, result in enumerate(search_results):
-                            with st.expander(f"{result['filename']} (Score: {result['score']:.3f})"):
-                                st.text(result['text'])
+                        # Show sources
+                        with st.expander("📄 Sources"):
+                            for i, result in enumerate(search_results):
+                                st.markdown(f"**{result['filename']}** (Relevance: {result['score']:.2f})")
+                                st.text(result['text'][:200] + "...")
+                                st.divider()
                     else:
-                        st.warning("No relevant documents found. Try uploading more documents or refining your query.")
-            else:
-                st.warning("Please enter a search query.")
+                        response = "I couldn't find any relevant information in the documents. Please make sure documents have been uploaded."
+                        st.markdown(response)
+                    
+                    # Add assistant message
+                    st.session_state.messages.append({"role": "assistant", "content": response})
     
-    # My Documents Tab
-    with tab3:
-        st.header("My Uploaded Documents")
-        
-        if st.session_state.uploaded_files:
-            df = pd.DataFrame(st.session_state.uploaded_files)
-            st.dataframe(df, use_container_width=True)
+    # Upload Tab (Admin only)
+    if tab2 and is_admin:
+        with tab2:
+            st.header("Upload Documents")
             
+            uploaded_files = st.file_uploader(
+                "Choose files to upload",
+                type=['pdf', 'docx', 'txt'],
+                accept_multiple_files=True
+            )
+            
+            if uploaded_files:
+                if st.button("Upload", type="primary"):
+                    progress_bar = st.progress(0)
+                    
+                    for idx, file in enumerate(uploaded_files):
+                        with st.spinner(f"Processing {file.name}..."):
+                            try:
+                                # Extract text based on file type
+                                file_extension = file.name.split('.')[-1].lower()
+                                
+                                if file_extension == 'pdf':
+                                    text = extract_text_from_pdf(file)
+                                elif file_extension == 'docx':
+                                    text = extract_text_from_docx(file)
+                                elif file_extension == 'txt':
+                                    text = extract_text_from_txt(file)
+                                else:
+                                    st.error(f"Unsupported file type: {file_extension}")
+                                    continue
+                                
+                                if not text:
+                                    st.error(f"No text extracted from {file.name}")
+                                    continue
+                                
+                                # Generate file hash
+                                file.seek(0)
+                                file_hash = hashlib.md5(file.read()).hexdigest()
+                                
+                                # Chunk text
+                                chunks = chunk_text(text)
+                                
+                                if not chunks:
+                                    st.error(f"No chunks created from {file.name}")
+                                    continue
+                                
+                                # Prepare metadata
+                                metadata = {
+                                    "filename": file.name,
+                                    "file_type": file_extension,
+                                    "file_hash": file_hash,
+                                    "upload_date": datetime.now().isoformat(),
+                                    "uploaded_by": st.session_state.authenticated_username
+                                }
+                                
+                                # Upload to Pinecone
+                                success = upload_to_pinecone(chunks, metadata, index)
+                                
+                                if success:
+                                    st.success(f"✅ {file.name} - {len(chunks)} chunks uploaded")
+                                else:
+                                    st.error(f"❌ Failed to upload {file.name}")
+                                    
+                            except Exception as e:
+                                st.error(f"Error processing {file.name}: {str(e)}")
+                        
+                        progress_bar.progress((idx + 1) / len(uploaded_files))
+                    
+                    st.balloons()
+    
+    # Document Library Tab
+    with tab3:
+        st.header("Document Library")
+        
+        if st.button("Refresh"):
+            st.rerun()
+        
+        with st.spinner("Loading documents..."):
+            df = get_all_documents(index)
+        
+        if not df.empty:
+            # Show metrics
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Total Documents", len(st.session_state.uploaded_files))
+                st.metric("Total Documents", len(df))
             with col2:
-                total_chunks = sum(doc['chunks'] for doc in st.session_state.uploaded_files)
-                st.metric("Total Chunks", total_chunks)
+                st.metric("Total Chunks", df['chunks'].sum())
             with col3:
-                st.metric("User", st.session_state.authenticated_username)
+                unique_uploaders = df['uploaded_by'].nunique()
+                st.metric("Contributors", unique_uploaders)
+            
+            # Show documents table
+            st.dataframe(
+                df.sort_values('upload_date', ascending=False),
+                use_container_width=True,
+                hide_index=True
+            )
         else:
-            st.info("No documents uploaded yet. Go to the Upload tab to add documents.")
+            st.info("No documents uploaded yet.")
+            if is_admin:
+                st.write("Go to the Upload Documents tab to add documents.")
 
 if __name__ == "__main__":
     main()
