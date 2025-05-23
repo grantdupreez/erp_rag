@@ -1,5 +1,4 @@
 import streamlit as st
-import anthropic
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 import hashlib
@@ -13,35 +12,22 @@ import json
 import re
 import PyPDF2
 import io
-
-# Lazy import to avoid startup issues
-@st.cache_resource
-def load_embedding_model():
-    try:
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer('all-MiniLM-L6-v2')
-    except Exception as e:
-        st.error(f"Error loading embedding model: {e}")
-        return None
+import requests
+import numpy as np
 
 # Configuration
 ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", None)
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
 QDRANT_URL = st.secrets.get("QDRANT_URL", None)
 QDRANT_API_KEY = st.secrets.get("QDRANT_API_KEY", None)
 COLLECTION_NAME = "erp_projects"
 
 class ERPProjectRAG:
     def __init__(self):
-        # Initialize Anthropic client with error handling
-        try:
-            if not ANTHROPIC_API_KEY:
-                st.error("ANTHROPIC_API_KEY not found in secrets")
-                self.anthropic_client = None
-            else:
-                self.anthropic_client = anthropic.Anthropic(api_key=str(ANTHROPIC_API_KEY))
-        except Exception as e:
-            st.error(f"Error initializing Anthropic client: {e}")
-            self.anthropic_client = None
+        # Store API keys
+        self.anthropic_api_key = ANTHROPIC_API_KEY
+        self.openai_api_key = OPENAI_API_KEY
+        self.embedding_dim = 1536  # OpenAI ada-002 embedding dimension
         
         # Initialize Qdrant client
         try:
@@ -52,7 +38,7 @@ class ERPProjectRAG:
                 self.qdrant_client = QdrantClient(
                     url=QDRANT_URL,
                     api_key=QDRANT_API_KEY,
-                    timeout=30  # Add timeout
+                    timeout=30
                 )
             else:
                 # Parse URL to extract host and port if needed
@@ -60,15 +46,10 @@ class ERPProjectRAG:
                     host, port = QDRANT_URL.split(":")
                     self.qdrant_client = QdrantClient(host=host, port=int(port))
                 else:
-                    # Assuming default port
                     self.qdrant_client = QdrantClient(url=QDRANT_URL)
         except Exception as e:
             st.error(f"Error connecting to Qdrant: {e}")
             self.qdrant_client = None
-        
-        # Initialize embedding model (lazy loading)
-        self.embedding_model = load_embedding_model()
-        self.embedding_dim = 384
         
         # Initialize collection if it doesn't exist
         if self.qdrant_client:
@@ -94,6 +75,44 @@ class ERPProjectRAG:
                 st.success(f"Created new collection: {COLLECTION_NAME}")
         except Exception as e:
             st.error(f"Error with Qdrant collection: {e}")
+    
+    def get_embedding(self, text: str) -> List[float]:
+        """Get embedding from OpenAI API"""
+        if not self.openai_api_key:
+            # Fallback to random embedding for testing
+            st.warning("OpenAI API key not found. Using random embeddings (for testing only).")
+            return np.random.rand(self.embedding_dim).tolist()
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.openai_api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "input": text,
+                "model": "text-embedding-ada-002"
+            }
+            
+            response = requests.post(
+                "https://api.openai.com/v1/embeddings",
+                headers=headers,
+                json=data,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result["data"][0]["embedding"]
+            else:
+                st.error(f"OpenAI API Error: {response.status_code} - {response.text}")
+                # Fallback to random embedding
+                return np.random.rand(self.embedding_dim).tolist()
+                
+        except Exception as e:
+            st.error(f"Error getting embedding: {e}")
+            # Fallback to random embedding
+            return np.random.rand(self.embedding_dim).tolist()
     
     def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
         """Split text into overlapping chunks"""
@@ -125,10 +144,6 @@ class ERPProjectRAG:
     def add_document(self, content: str, metadata: Dict[str, Any]) -> bool:
         """Add a document to the RAG system"""
         try:
-            if not self.embedding_model:
-                st.error("Embedding model not available")
-                return False
-            
             if not self.qdrant_client:
                 st.error("Qdrant client not available")
                 return False
@@ -143,7 +158,7 @@ class ERPProjectRAG:
             points = []
             for i, chunk in enumerate(chunks):
                 # Generate embedding
-                embedding = self.embedding_model.encode(chunk).tolist()
+                embedding = self.get_embedding(chunk)
                 
                 # Create point
                 point = PointStruct(
@@ -173,16 +188,12 @@ class ERPProjectRAG:
     def search_documents(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Search for relevant documents"""
         try:
-            if not self.embedding_model:
-                st.error("Embedding model not available")
-                return []
-            
             if not self.qdrant_client:
                 st.error("Qdrant client not available")
                 return []
                 
             # Generate query embedding
-            query_embedding = self.embedding_model.encode(query).tolist()
+            query_embedding = self.get_embedding(query)
             
             # Search in Qdrant
             results = self.qdrant_client.search(
@@ -208,9 +219,9 @@ class ERPProjectRAG:
             return []
     
     def generate_response(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
-        """Generate response using Claude 4 with retrieved context"""
+        """Generate response using Claude API directly"""
         
-        if not self.anthropic_client:
+        if not self.anthropic_api_key:
             return "I apologize, but the AI service is not configured properly. Please contact your administrator."
         
         # Build context from retrieved documents
@@ -239,15 +250,41 @@ Guidelines:
 Response:"""
 
         try:
-            # Call Claude 4
-            response = self.anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1500,
-                temperature=0.1,
-                messages=[{"role": "user", "content": prompt}]
+            # Direct API call without using the anthropic library
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": self.anthropic_api_key,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            data = {
+                "model": "claude-3-sonnet-20240229",
+                "max_tokens": 1500,
+                "temperature": 0.1,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            
+            # Make the API request
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data,
+                timeout=30
             )
             
-            return response.content[0].text
+            if response.status_code == 200:
+                result = response.json()
+                return result["content"][0]["text"]
+            else:
+                error_msg = f"API Error: {response.status_code}"
+                if response.text:
+                    error_msg += f" - {response.text}"
+                st.error(error_msg)
+                return "I apologize, but I encountered an error while generating a response. Please check your API key and try again."
+                
+        except requests.exceptions.Timeout:
+            st.error("Request timed out. Please try again.")
+            return "The request took too long to process. Please try again."
         except Exception as e:
             st.error(f"Error generating response: {e}")
             return "I apologize, but I encountered an error while generating a response. Please try again."
@@ -312,7 +349,7 @@ def main():
     )
     
     st.title("🏗️ ERP Project Management RAG Assistant")
-    st.markdown("*Powered by Claude 4 and your project knowledge base*")
+    st.markdown("*Powered by Claude API and your project knowledge base*")
     
     # Display current user in the top right
     col1, col2 = st.columns([6, 1])
@@ -328,6 +365,11 @@ def main():
         with st.sidebar:
             st.header("📚 Knowledge Base Management")
             st.markdown("*Admin access only*")
+            
+            # Check configuration status
+            if not OPENAI_API_KEY:
+                st.warning("⚠️ OpenAI API key not configured. Using random embeddings for testing.")
+                st.info("Add OPENAI_API_KEY to secrets for production use.")
             
             # Document upload section
             st.subheader("Add New Project Document")
