@@ -27,7 +27,11 @@ class ERPProjectRAG:
         # Store API keys
         self.anthropic_api_key = ANTHROPIC_API_KEY
         self.openai_api_key = OPENAI_API_KEY
-        self.embedding_dim = 1536  # OpenAI ada-002 embedding dimension
+        
+        # Initialize with a default embedding dimension
+        # Will be updated based on collection settings if needed
+        self.embedding_dim = 384  # Default to text-embedding-3-small
+        self.embedding_model = "text-embedding-3-small"
         
         # Initialize Qdrant client
         try:
@@ -54,9 +58,12 @@ class ERPProjectRAG:
         # Initialize collection if it doesn't exist
         if self.qdrant_client:
             self._ensure_collection_exists()
+            
+        # Validate Claude model
+        self.claude_model = self.validate_claude_model()
     
     def _ensure_collection_exists(self):
-        """Create Qdrant collection if it doesn't exist"""
+        """Create Qdrant collection if it doesn't exist, or validate dimensions if it does"""
         if not self.qdrant_client:
             return
             
@@ -65,6 +72,7 @@ class ERPProjectRAG:
             collection_names = [col.name for col in collections.collections]
             
             if COLLECTION_NAME not in collection_names:
+                # Create new collection with the correct dimensions
                 self.qdrant_client.create_collection(
                     collection_name=COLLECTION_NAME,
                     vectors_config=VectorParams(
@@ -72,15 +80,96 @@ class ERPProjectRAG:
                         distance=Distance.COSINE
                     )
                 )
-                st.success(f"Created new collection: {COLLECTION_NAME}")
+                st.success(f"Created new collection: {COLLECTION_NAME} with dimension {self.embedding_dim}")
+            else:
+                # Collection exists, check if dimensions match
+                collection_info = self.qdrant_client.get_collection(COLLECTION_NAME)
+                actual_dim = collection_info.config.params.vectors.size
+                
+                if actual_dim != self.embedding_dim:
+                    st.warning(f"Dimension mismatch! Collection expects {actual_dim} but code is using {self.embedding_dim}")
+                    st.info(f"Adjusting embedding dimension to match collection: {actual_dim}")
+                    self.embedding_dim = actual_dim
+                    
+                    # Update the model based on the dimension
+                    if actual_dim == 1536:
+                        st.info("Using text-embedding-ada-002 model (1536 dimensions)")
+                        self.embedding_model = "text-embedding-ada-002"
+                    elif actual_dim == 384:
+                        st.info("Using text-embedding-3-small model (384 dimensions)")
+                        self.embedding_model = "text-embedding-3-small"
+                    elif actual_dim == 3072:
+                        st.info("Using text-embedding-3-large model (3072 dimensions)")
+                        self.embedding_model = "text-embedding-3-large"
+                    else:
+                        st.warning(f"Unknown dimension: {actual_dim}. Using random embeddings for testing.")
+                        self.embedding_model = None
+                
         except Exception as e:
             st.error(f"Error with Qdrant collection: {e}")
+            # Provide more helpful error message
+            if "dimension" in str(e).lower():
+                st.error("Vector dimension mismatch. You may need to recreate your collection or adjust your embedding model.")
+    
+    def validate_claude_model(self) -> str:
+        """Validate which Claude models are available and return a working model name"""
+        if not self.anthropic_api_key:
+            return None
+            
+        # List of models to try, from newest to oldest
+        model_candidates = [
+            "claude-3-sonnet-20240530",  # May 2025 hypothetical model
+            "claude-3-opus-20240229",
+            "claude-3-sonnet-20240229", 
+            "claude-3-haiku-20240307",
+            "claude-2.1"  # Fallback to older model if needed
+        ]
+        
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.anthropic_api_key,
+            "anthropic-version": "2023-06-01"
+        }
+        
+        # Simple test prompt
+        data = {
+            "max_tokens": 10,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }
+        
+        # Try each model until one works
+        working_model = None
+        for model in model_candidates:
+            try:
+                data["model"] = model
+                response = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers,
+                    json=data,
+                    timeout=5  # Short timeout for testing
+                )
+                
+                if response.status_code == 200:
+                    working_model = model
+                    st.success(f"Successfully connected to Claude API using model: {model}")
+                    break
+                else:
+                    st.warning(f"Model {model} not available: {response.status_code}")
+                    
+            except Exception as e:
+                st.warning(f"Error testing model {model}: {e}")
+        
+        if not working_model:
+            st.error("No Claude models are working. Please check your API key and configuration.")
+        
+        return working_model
     
     def get_embedding(self, text: str) -> List[float]:
         """Get embedding from OpenAI API"""
-        if not self.openai_api_key:
+        if not self.openai_api_key or not self.embedding_model:
             # Fallback to random embedding for testing
-            st.warning("OpenAI API key not found. Using random embeddings (for testing only).")
+            st.warning("OpenAI API key not found or model not set. Using random embeddings (for testing only).")
             return np.random.rand(self.embedding_dim).tolist()
         
         try:
@@ -91,7 +180,7 @@ class ERPProjectRAG:
             
             data = {
                 "input": text,
-                "model": "text-embedding-ada-002"
+                "model": self.embedding_model
             }
             
             response = requests.post(
@@ -221,7 +310,7 @@ class ERPProjectRAG:
     def generate_response(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
         """Generate response using Claude API directly"""
         
-        if not self.anthropic_api_key:
+        if not self.anthropic_api_key or not self.claude_model:
             return "I apologize, but the AI service is not configured properly. Please contact your administrator."
         
         # Build context from retrieved documents
@@ -257,8 +346,9 @@ Response:"""
                 "anthropic-version": "2023-06-01"
             }
             
+            # Use the validated model
             data = {
-                "model": "claude-3-sonnet-20240229",
+                "model": self.claude_model,
                 "max_tokens": 1500,
                 "temperature": 0.1,
                 "messages": [{"role": "user", "content": prompt}]
@@ -280,7 +370,7 @@ Response:"""
                 if response.text:
                     error_msg += f" - {response.text}"
                 st.error(error_msg)
-                return "I apologize, but I encountered an error while generating a response. Please check your API key and try again."
+                return "I apologize, but I encountered an error while generating a response. Please check your API key and model configuration and try again."
                 
         except requests.exceptions.Timeout:
             st.error("Request timed out. Please try again.")
@@ -325,9 +415,6 @@ def check_password():
         st.error("😕 User not known or password incorrect")
     return False
 
-if not check_password():
-    st.stop()
-
 def extract_text_from_pdf(pdf_file):
     """Extract text from PDF file"""
     try:
@@ -340,6 +427,48 @@ def extract_text_from_pdf(pdf_file):
     except Exception as e:
         st.error(f"Error reading PDF: {e}")
         return None
+
+def check_system_status():
+    """Check the status of all system components and display in Streamlit"""
+    st.subheader("🔧 System Status")
+    
+    # Check Qdrant Connection
+    if st.session_state.rag_system.qdrant_client:
+        try:
+            collection_info = st.session_state.rag_system.qdrant_client.get_collection(COLLECTION_NAME)
+            st.success("✅ Qdrant Connection: **Connected**")
+            st.info(f"Collection: {COLLECTION_NAME}, Vector Dimension: {collection_info.config.params.vectors.size}")
+            st.info(f"Documents: {collection_info.points_count}")
+        except Exception as e:
+            st.error(f"❌ Qdrant Connection Error: {e}")
+    else:
+        st.error("❌ Qdrant Connection: **Not Connected**")
+    
+    # Check OpenAI API
+    if st.session_state.rag_system.openai_api_key:
+        try:
+            # Test embedding
+            test_embedding = st.session_state.rag_system.get_embedding("Test embedding")
+            if len(test_embedding) == st.session_state.rag_system.embedding_dim:
+                st.success("✅ OpenAI Embedding API: **Connected**")
+                st.info(f"Embedding Model: {getattr(st.session_state.rag_system, 'embedding_model', 'Unknown')}")
+                st.info(f"Embedding Dimension: {st.session_state.rag_system.embedding_dim}")
+            else:
+                st.warning(f"⚠️ OpenAI Embedding API: Dimension mismatch ({len(test_embedding)} vs {st.session_state.rag_system.embedding_dim})")
+        except Exception as e:
+            st.error(f"❌ OpenAI Embedding API Error: {e}")
+    else:
+        st.warning("⚠️ OpenAI Embedding API: **Not Configured** (using random embeddings)")
+    
+    # Check Claude API
+    if st.session_state.rag_system.anthropic_api_key:
+        if hasattr(st.session_state.rag_system, 'claude_model') and st.session_state.rag_system.claude_model:
+            st.success("✅ Claude API: **Connected**")
+            st.info(f"Claude Model: {st.session_state.rag_system.claude_model}")
+        else:
+            st.error("❌ Claude API: **No Working Model Found**")
+    else:
+        st.error("❌ Claude API: **Not Configured**")
 
 def main():
     st.set_page_config(
@@ -366,6 +495,10 @@ def main():
             st.header("📚 Knowledge Base Management")
             st.markdown("*Admin access only*")
             
+            # System status check
+            if st.button("🔄 Check System Status"):
+                pass  # Will trigger the check_system_status() function below
+                
             # Check configuration status
             if not OPENAI_API_KEY:
                 st.warning("⚠️ OpenAI API key not configured. Using random embeddings for testing.")
@@ -440,6 +573,9 @@ def main():
                     st.metric("Total Documents", "N/A")
             else:
                 st.metric("Total Documents", "Not connected")
+        
+        # Display system status for admin users
+        check_system_status()
     
     # Main chat interface (visible to all users)
     st.header("💬 Ask Your Project Management Assistant")
@@ -507,4 +643,8 @@ if __name__ == "__main__":
         st.info("Please configure these in your Streamlit secrets.")
         st.stop()
     
+    # Check password before starting the app
+    if not check_password():
+        st.stop()
+        
     main()
