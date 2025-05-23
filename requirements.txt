@@ -1,7 +1,6 @@
 streamlit>=1.31.0
 qdrant-client>=1.7.0
-sentence-transformers>=2.2.0
 pandas>=2.0.0
 PyPDF2>=3.0.0
 requests>=2.31.0
-anthropic
+numpy>=1.24.0
