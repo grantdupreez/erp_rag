@@ -12,6 +12,7 @@ import json
 import os
 from typing import List, Dict, Any
 import hashlib
+import hmac
 
 # Initialize session state
 if 'authenticated' not in st.session_state:
