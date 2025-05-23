@@ -1,5 +1,5 @@
 streamlit>=1.31.0
-pinecone-client>=3.0.0
+pinecone>=2.0.0
 openai>=1.12.0
 PyPDF2>=3.0.1
 python-docx>=1.1.0
