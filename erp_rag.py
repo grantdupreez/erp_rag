@@ -329,7 +329,7 @@ def main():
             st.rerun()
     
     # Check if user is admin
-    is_admin = st.session_state.authenticated_username in st.secrets.get("admin_users", [])
+    is_admin = st.session_state.authenticated_username in st.secrets.get("admin_users")
     
     # Tabs
     if is_admin:
