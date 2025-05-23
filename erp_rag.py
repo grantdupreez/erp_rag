@@ -135,20 +135,33 @@ async def ensure_collection_exists():
         return False
         
     try:
-        # Try to get collection info
-        try:
-            await qdrant_client.get_collection(collection_name=COLLECTION_NAME)
-            return True
-        except:
+        # First, check if collection exists by listing all collections
+        collections = await qdrant_client.get_collections()
+        collection_exists = any(c.name == COLLECTION_NAME for c in collections.collections)
+        
+        if collection_exists:
+            # Collection exists, verify we can access it
+            try:
+                await qdrant_client.get_collection(collection_name=COLLECTION_NAME)
+                return True
+            except Exception as e:
+                st.error(f"Collection exists but cannot access it: {e}")
+                return False
+        else:
             # Collection doesn't exist, create it
-            await qdrant_client.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=384, distance=Distance.COSINE)
-            )
-            st.success(f"Created collection: {COLLECTION_NAME}")
-            return True
+            try:
+                await qdrant_client.create_collection(
+                    collection_name=COLLECTION_NAME,
+                    vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+                )
+                st.success(f"Created collection: {COLLECTION_NAME}")
+                return True
+            except Exception as e:
+                st.error(f"Error creating collection: {e}")
+                return False
+                
     except Exception as e:
-        st.error(f"Error with Qdrant collection: {e}")
+        st.error(f"Error checking collections: {e}")
         return False
 
 async def upload_to_qdrant(chunks: List[str], metadata: Dict[str, Any], username: str):
