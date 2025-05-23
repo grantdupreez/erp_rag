@@ -1,4 +1,12 @@
 import streamlit as st
+
+# IMPORTANT: Page config must be the first Streamlit command
+st.set_page_config(
+    page_title="ERP Project Manager",
+    page_icon="📊",
+    layout="wide"
+)
+
 import asyncio
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
@@ -19,6 +27,8 @@ if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 if 'username' not in st.session_state:
     st.session_state.username = None
+if 'authenticated_username' not in st.session_state:
+    st.session_state.authenticated_username = None
 if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = []
 
@@ -224,13 +234,6 @@ Answer:"""
 
 # Main application
 def main():
-    # Set page config
-    st.set_page_config(
-        page_title="ERP Project Manager",
-        page_icon="📊",
-        layout="wide"
-    )
-    
     # Login page
     def check_password():
         """Returns `True` if the user had a correct password."""
@@ -251,7 +254,8 @@ def main():
                 st.secrets.passwords[st.session_state["username"]],
             ):
                 st.session_state["password_correct"] = True
-                del st.session_state["password"]  # Don't store the username or password.
+                st.session_state["authenticated_username"] = st.session_state["username"]  # Store username separately
+                del st.session_state["password"]  # Don't store the password
                 del st.session_state["username"]
             else:
                 st.session_state["password_correct"] = False
@@ -278,7 +282,7 @@ def main():
     with col3:
         user_col1, user_col2 = st.columns([3, 1])
         with user_col1:
-            st.markdown(f"**User:** {st.session_state.username}")
+            st.markdown(f"**User:** {st.session_state.authenticated_username}")
         with user_col2:
             if st.button("Logout", key="logout_btn", type="secondary"):
                 # Clear session state
@@ -323,7 +327,7 @@ def main():
                         success = asyncio.run(upload_to_qdrant(
                             chunks, 
                             file_data, 
-                            st.session_state.username
+                            st.session_state.authenticated_username
                         ))
                         
                         if success:
@@ -358,7 +362,7 @@ def main():
                     # Search documents
                     search_results = asyncio.run(search_documents(
                         query, 
-                        st.session_state.username, 
+                        st.session_state.authenticated_username, 
                         num_results
                     ))
                     
@@ -397,7 +401,7 @@ def main():
                 total_chunks = sum(doc['chunks'] for doc in st.session_state.uploaded_files)
                 st.metric("Total Chunks", total_chunks)
             with col3:
-                st.metric("User", st.session_state.username)
+                st.metric("User", st.session_state.authenticated_username)
         else:
             st.info("No documents uploaded yet. Go to the Upload tab to add documents.")
 
