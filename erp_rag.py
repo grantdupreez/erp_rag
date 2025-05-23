@@ -19,12 +19,15 @@ import hmac
 from typing import List, Dict, Any
 import time
 import json
+import re
 
 # Initialize session state
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 if 'username' not in st.session_state:
     st.session_state.username = None
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
 
 # Configuration
 PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
@@ -151,8 +154,10 @@ def upload_to_pinecone(chunks: List[str], metadata: Dict[str, Any], index):
             "metadata": {
                 "text": chunk[:1000],  # Limit metadata size
                 "chunk_index": i,
+                "total_chunks": len(chunks),
                 "filename": metadata["filename"],
                 "file_type": metadata["file_type"],
+                "file_hash": metadata["file_hash"],
                 "upload_date": metadata["upload_date"],
                 "uploaded_by": metadata["uploaded_by"]
             }
@@ -168,6 +173,40 @@ def upload_to_pinecone(chunks: List[str], metadata: Dict[str, Any], index):
     except Exception as e:
         st.error(f"Error uploading to Pinecone: {e}")
         return False
+
+def delete_document(filename: str, file_hash: str, index):
+    """Delete all chunks of a document from Pinecone"""
+    try:
+        # Get all vector IDs for this document
+        vector_ids = []
+        
+        # Query to find the document's chunks
+        results = index.query(
+            vector=[0] * 1536,  # Dummy vector
+            filter={
+                "filename": {"$eq": filename},
+                "file_hash": {"$eq": file_hash}
+            },
+            top_k=10000,
+            include_metadata=False
+        )
+        
+        # Extract vector IDs
+        vector_ids = [match["id"] for match in results["matches"]]
+        
+        if vector_ids:
+            # Delete in batches
+            batch_size = 100
+            for i in range(0, len(vector_ids), batch_size):
+                batch = vector_ids[i:i + batch_size]
+                index.delete(ids=batch)
+            return True, len(vector_ids)
+        else:
+            return False, 0
+            
+    except Exception as e:
+        st.error(f"Error deleting document: {e}")
+        return False, 0
 
 def search_documents(query: str, index, limit: int = 5) -> List[Dict[str, Any]]:
     """Search for relevant documents"""
@@ -187,7 +226,8 @@ def search_documents(query: str, index, limit: int = 5) -> List[Dict[str, Any]]:
                 "text": match["metadata"]["text"],
                 "score": match["score"],
                 "filename": match["metadata"]["filename"],
-                "chunk_index": match["metadata"]["chunk_index"]
+                "chunk_index": match["metadata"]["chunk_index"],
+                "total_chunks": match["metadata"].get("total_chunks", "?")
             }
             for match in results["matches"]
         ]
@@ -195,31 +235,39 @@ def search_documents(query: str, index, limit: int = 5) -> List[Dict[str, Any]]:
         st.error(f"Error searching: {e}")
         return []
 
-def generate_response(query: str, context: List[Dict[str, Any]]) -> str:
-    """Generate response using OpenAI"""
+def generate_response_with_citations(query: str, context: List[Dict[str, Any]]) -> str:
+    """Generate response using OpenAI with inline citations"""
     if not context:
         return "I couldn't find any relevant information in the uploaded documents."
     
-    context_text = "\n\n".join([
-        f"[From {doc['filename']}]:\n{doc['text']}" 
-        for doc in context
-    ])
+    # Prepare context with citation markers
+    context_text = ""
+    citation_map = {}
+    
+    for idx, doc in enumerate(context):
+        citation_key = f"[{idx + 1}]"
+        citation_map[citation_key] = f"{doc['filename']} (chunk {doc['chunk_index'] + 1}/{doc['total_chunks']})"
+        context_text += f"{citation_key} {doc['text']}\n\n"
     
     messages = [
         {
             "role": "system",
-            "content": "You are a helpful assistant that answers questions based on the provided document context. Only use information from the context to answer questions."
+            "content": """You are a helpful assistant that answers questions based on the provided document context. 
+            When you use information from the context, include the citation number in square brackets (e.g., [1], [2]) 
+            immediately after the relevant information. You may use multiple citations if information comes from multiple sources.
+            Only use information from the provided context."""
         },
         {
             "role": "user",
-            "content": f"""Based on the following context from uploaded documents, please answer the question.
+            "content": f"""Based on the following context from uploaded documents, please answer the question. 
+            Include citations in square brackets when using information from specific sources.
 
 Context:
 {context_text}
 
 Question: {query}
 
-Answer based only on the provided context. If the answer is not in the context, say so."""
+Answer with citations:"""
         }
     ]
     
@@ -230,13 +278,36 @@ Answer based only on the provided context. If the answer is not in the context, 
             temperature=0.7,
             max_tokens=1000
         )
-        return response.choices[0].message.content
+        
+        answer = response.choices[0].message.content
+        
+        # Add citation references at the end
+        citation_text = "\n\n**Sources:**\n"
+        for key, value in citation_map.items():
+            if key in answer:
+                citation_text += f"{key} {value}\n"
+        
+        return answer + citation_text
+        
     except Exception as e:
         st.error(f"Error generating response: {e}")
         return "Sorry, I couldn't generate a response."
 
+def export_chat_history(messages: List[Dict[str, str]], username: str) -> str:
+    """Export chat history to markdown format"""
+    export_text = f"# ERP Document Assistant - Chat Export\n\n"
+    export_text += f"**User:** {username}\n"
+    export_text += f"**Export Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    export_text += "---\n\n"
+    
+    for message in messages:
+        role = "**You:**" if message["role"] == "user" else "**Assistant:**"
+        export_text += f"{role}\n{message['content']}\n\n"
+    
+    return export_text
+
 def get_all_documents(index) -> pd.DataFrame:
-    """Get list of all uploaded documents"""
+    """Get list of all uploaded documents with file hash"""
     try:
         # Query with a dummy vector to get metadata
         results = index.query(
@@ -250,10 +321,12 @@ def get_all_documents(index) -> pd.DataFrame:
         for match in results["matches"]:
             metadata = match["metadata"]
             filename = metadata.get("filename", "Unknown")
+            file_hash = metadata.get("file_hash", "")
             
             if filename not in documents:
                 documents[filename] = {
                     "filename": filename,
+                    "file_hash": file_hash,
                     "upload_date": metadata.get("upload_date", "Unknown"),
                     "uploaded_by": metadata.get("uploaded_by", "Unknown"),
                     "file_type": metadata.get("file_type", "Unknown"),
@@ -329,7 +402,15 @@ def main():
             st.rerun()
     
     # Check if user is admin
-    is_admin = st.session_state.authenticated_username in st.secrets.get("admin_users")
+    admin_users_config = st.secrets.get("admin_users", "admin")
+    if isinstance(admin_users_config, str):
+        admin_users = [user.strip() for user in admin_users_config.split(',')]
+    elif isinstance(admin_users_config, list):
+        admin_users = admin_users_config
+    else:
+        admin_users = ["admin"]
+    
+    is_admin = st.session_state.authenticated_username in admin_users
     
     # Tabs
     if is_admin:
@@ -342,9 +423,20 @@ def main():
     with tab1:
         st.header("Chat with Documents")
         
-        # Chat interface
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
+        # Export button
+        if st.session_state.messages:
+            col1, col2 = st.columns([6, 1])
+            with col2:
+                export_text = export_chat_history(
+                    st.session_state.messages, 
+                    st.session_state.authenticated_username
+                )
+                st.download_button(
+                    label="📥 Export Chat",
+                    data=export_text,
+                    file_name=f"chat_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                    mime="text/markdown"
+                )
         
         # Display chat history
         for message in st.session_state.messages:
@@ -365,22 +457,29 @@ def main():
                     search_results = search_documents(prompt, index, limit=5)
                     
                     if search_results:
-                        # Generate response
-                        response = generate_response(prompt, search_results)
+                        # Generate response with citations
+                        response = generate_response_with_citations(prompt, search_results)
                         st.markdown(response)
                         
-                        # Show sources
-                        with st.expander("📄 Sources"):
+                        # Show detailed sources
+                        with st.expander("📄 View Source Documents"):
                             for i, result in enumerate(search_results):
-                                st.markdown(f"**{result['filename']}** (Relevance: {result['score']:.2f})")
-                                st.text(result['text'][:200] + "...")
-                                st.divider()
+                                st.markdown(f"**[{i+1}] {result['filename']}** (Chunk {result['chunk_index']+1}/{result['total_chunks']}, Relevance: {result['score']:.2f})")
+                                st.text(result['text'][:300] + "...")
+                                if i < len(search_results) - 1:
+                                    st.divider()
                     else:
                         response = "I couldn't find any relevant information in the documents. Please make sure documents have been uploaded."
                         st.markdown(response)
                     
                     # Add assistant message
                     st.session_state.messages.append({"role": "assistant", "content": response})
+        
+        # Clear chat button
+        if st.session_state.messages:
+            if st.button("Clear Chat History"):
+                st.session_state.messages = []
+                st.rerun()
     
     # Upload Tab (Admin only)
     if tab2 and is_admin:
@@ -456,8 +555,10 @@ def main():
     with tab3:
         st.header("Document Library")
         
-        if st.button("Refresh"):
-            st.rerun()
+        col1, col2 = st.columns([4, 1])
+        with col2:
+            if st.button("🔄 Refresh"):
+                st.rerun()
         
         with st.spinner("Loading documents..."):
             df = get_all_documents(index)
@@ -473,12 +574,47 @@ def main():
                 unique_uploaders = df['uploaded_by'].nunique()
                 st.metric("Contributors", unique_uploaders)
             
-            # Show documents table
-            st.dataframe(
-                df.sort_values('upload_date', ascending=False),
-                use_container_width=True,
-                hide_index=True
-            )
+            # Document management for admins
+            if is_admin:
+                st.subheader("Document Management")
+                
+                # Create a container for each document
+                for idx, row in df.iterrows():
+                    with st.container():
+                        col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 1])
+                        
+                        with col1:
+                            st.write(f"📄 **{row['filename']}**")
+                        with col2:
+                            st.write(f"{row['chunks']} chunks")
+                        with col3:
+                            st.write(f"by {row['uploaded_by']}")
+                        with col4:
+                            upload_date = datetime.fromisoformat(row['upload_date'])
+                            st.write(upload_date.strftime('%Y-%m-%d'))
+                        with col5:
+                            if st.button("🗑️ Delete", key=f"delete_{idx}"):
+                                with st.spinner(f"Deleting {row['filename']}..."):
+                                    success, chunks_deleted = delete_document(
+                                        row['filename'], 
+                                        row['file_hash'], 
+                                        index
+                                    )
+                                    if success:
+                                        st.success(f"Deleted {chunks_deleted} chunks")
+                                        time.sleep(1)
+                                        st.rerun()
+                                    else:
+                                        st.error("Failed to delete document")
+                        
+                        st.divider()
+            else:
+                # Non-admin view
+                st.dataframe(
+                    df[['filename', 'chunks', 'uploaded_by', 'upload_date']].sort_values('upload_date', ascending=False),
+                    use_container_width=True,
+                    hide_index=True
+                )
         else:
             st.info("No documents uploaded yet.")
             if is_admin:
